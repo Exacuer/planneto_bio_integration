@@ -1,12 +1,17 @@
 # Copyright (c) 2026, Administrator and contributors
 # For license information, please see license.txt
 
-import requests
-import frappe
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
 
+import frappe
+import requests
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import now_datetime, get_datetime
+from frappe.utils import get_datetime, now_datetime
+
+SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+TEMPURI_NS = "http://tempuri.org/"
 
 
 class eSSLIntegrationSettings(Document):
@@ -25,6 +30,10 @@ class eSSLIntegrationSettings(Document):
             frappe.throw(_("Please configure Username."))
 
         if not self.password:
+            frappe.throw(_("Please configure Password."))
+
+        password = self.get_password("password")
+        if not password:
             frappe.throw(_("Please configure Password."))
 
         enabled_devices = [
@@ -126,34 +135,23 @@ class eSSLIntegrationSettings(Document):
                 # SOAP request
                 # -------------------------------------------------
 
-                soap_body = f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-    xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-
-    <soap:Body>
-
-        <GetTransactionsLog xmlns="http://tempuri.org/">
-
-            <FromDateTime>{from_time_str}</FromDateTime>
-
-            <ToDateTime>{to_time_str}</ToDateTime>
-
-            <SerialNumber>{serial_number}</SerialNumber>
-
-            <UserName>{self.username}</UserName>
-
-            <UserPassword>{self.password}</UserPassword>
-
-            <strDataList></strDataList>
-
-        </GetTransactionsLog>
-
-    </soap:Body>
-
-</soap:Envelope>
-"""
+                soap_body = (
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+                    ' xmlns:xsd="http://www.w3.org/2001/XMLSchema"'
+                    ' xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+                    "<soap:Body>"
+                    '<GetTransactionsLog xmlns="http://tempuri.org/">'
+                    f"<FromDateTime>{escape(from_time_str)}</FromDateTime>"
+                    f"<ToDateTime>{escape(to_time_str)}</ToDateTime>"
+                    f"<SerialNumber>{escape(serial_number)}</SerialNumber>"
+                    f"<UserName>{escape(self.username)}</UserName>"
+                    f"<UserPassword>{escape(password)}</UserPassword>"
+                    "<strDataList></strDataList>"
+                    "</GetTransactionsLog>"
+                    "</soap:Body>"
+                    "</soap:Envelope>"
+                )
 
                 headers = {
                     "Content-Type": "text/xml; charset=utf-8",
@@ -162,7 +160,7 @@ class eSSLIntegrationSettings(Document):
 
                 response = requests.post(
                     api_url,
-                    data=soap_body,
+                    data=soap_body.encode("utf-8"),
                     headers=headers,
                     timeout=60
                 )
@@ -185,29 +183,44 @@ class eSSLIntegrationSettings(Document):
                     continue
 
                 # -------------------------------------------------
-                # Parse XML
+                # Parse SOAP 1.1 response:
+                # GetTransactionsLogResult = status
+                # strDataList = punch rows
                 # -------------------------------------------------
 
-                from xml.etree import ElementTree as ET
-
-                root = ET.fromstring(response.content)
-
-                str_data_element = root.find(
-                    ".//{http://tempuri.org/}strDataList"
-                )
-
-                if str_data_element is None:
-
+                try:
+                    root = ET.fromstring(response.content)
+                except ET.ParseError:
                     errors.append(
-                        _(
-                            "Device {0}: eSSL returned no strDataList."
-                        ).format(serial_number)
+                        _("Device {0}: eSSL returned invalid XML.").format(serial_number)
                     )
-
                     continue
 
-                if not str_data_element.text:
+                fault = root.find(f".//{{{SOAP_NS}}}Fault")
+                if fault is not None:
+                    fault_text = "".join(fault.itertext()).strip() or "SOAP Fault"
+                    errors.append(
+                        _("Device {0}: {1}").format(serial_number, fault_text)
+                    )
+                    continue
 
+                result_element = root.find(f".//{{{TEMPURI_NS}}}GetTransactionsLogResult")
+                str_data_element = root.find(f".//{{{TEMPURI_NS}}}strDataList")
+
+                result_text = (result_element.text or "").strip() if result_element is not None else ""
+                punch_text = (str_data_element.text or "").strip() if str_data_element is not None else ""
+
+                if self._is_essl_api_error(result_text):
+                    errors.append(
+                        _("Device {0}: {1}").format(serial_number, result_text)
+                    )
+                    continue
+
+                # Some eSSL builds put the log rows in the result field.
+                if not punch_text and self._looks_like_punch_log(result_text):
+                    punch_text = result_text
+
+                if not punch_text:
                     device.last_synced_at = current_time
                     continue
 
@@ -215,7 +228,7 @@ class eSSLIntegrationSettings(Document):
                 # eSSL returns tab-separated lines
                 # -------------------------------------------------
 
-                raw_logs = str_data_element.text.strip().splitlines()
+                raw_logs = punch_text.splitlines()
 
                 for raw_log in raw_logs:
 
@@ -475,3 +488,30 @@ class eSSLIntegrationSettings(Document):
             "errors": errors,
             "message": message
         }
+
+    @staticmethod
+    def _is_essl_api_error(result_text):
+        if not result_text:
+            return False
+
+        if "\t" in result_text or "\n" in result_text:
+            return False
+
+        lowered = result_text.lower()
+        error_tokens = (
+            "invalid",
+            "fail",
+            "error",
+            "unauthor",
+            "denied",
+            "wrong",
+            "not exist",
+            "not found",
+        )
+        return any(token in lowered for token in error_tokens)
+
+    @staticmethod
+    def _looks_like_punch_log(text):
+        if not text:
+            return False
+        return "\t" in text or "\n" in text
