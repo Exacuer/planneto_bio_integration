@@ -957,10 +957,18 @@ class eSSLIntegrationSettings(Document):
 
 
 AUTO_SYNC_JOB_ID = "planneto_essl_auto_sync"
+AUTO_SYNC_LOCK_KEY = "planneto_essl_auto_sync_lock"
 AUTO_SYNC_METHOD = (
 	"planneto_bio_integration.planneto_bio_integration.doctype."
 	"essl_integration_settings.essl_integration_settings.auto_sync_essl_punches"
 )
+
+
+def _settings_value(fieldname):
+	"""Always read from DB — cached singles caused ~1s sync loops on cloud."""
+	return frappe.db.get_single_value(
+		"eSSL Integration Settings", fieldname, cache=False
+	)
 
 
 def _is_valid_sync_time(value):
@@ -979,18 +987,21 @@ def _wait_until_next_interval(interval_seconds, last_auto_sync_at):
 		return True
 
 	while True:
-		if not cint(
-			frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
-		):
+		if not cint(_settings_value("enable_auto_sync")):
 			return False
+
+		# Re-read last stamp each loop so parallel jobs can't race the cache.
+		last_auto_sync_at = _settings_value("last_auto_sync_at")
+		if not _is_valid_sync_time(last_auto_sync_at):
+			return True
 
 		elapsed = time_diff_in_seconds(
 			now_datetime(), get_datetime(last_auto_sync_at)
 		)
-		remaining = interval_seconds - elapsed
+		remaining = float(interval_seconds) - float(elapsed)
 		if remaining <= 0:
 			return True
-		time.sleep(min(remaining, 2))
+		time.sleep(min(remaining, 1))
 
 
 def _mark_last_auto_sync():
@@ -998,8 +1009,12 @@ def _mark_last_auto_sync():
 		"eSSL Integration Settings",
 		"last_auto_sync_at",
 		now_datetime(),
+		update_modified=False,
 	)
 	frappe.db.commit()
+	frappe.clear_document_cache(
+		"eSSL Integration Settings", "eSSL Integration Settings"
+	)
 
 
 def auto_sync_essl_punches():
@@ -1007,29 +1022,38 @@ def auto_sync_essl_punches():
 	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
 		return
 
-	settings = frappe.get_single("eSSL Integration Settings")
-	if not cint(settings.enable_auto_sync):
+	if not cint(_settings_value("enable_auto_sync")):
 		return
 
-	if not settings.base_url or not settings.username:
+	if not _settings_value("base_url") or not _settings_value("username"):
 		return
 
-	interval_seconds = max(cint(settings.auto_sync_interval) or 30, 5)
-	if not _wait_until_next_interval(interval_seconds, settings.last_auto_sync_at):
-		return
+	interval_seconds = max(cint(_settings_value("auto_sync_interval")) or 30, 5)
+	lock_ttl = max(interval_seconds + READ_TIMEOUT + 60, 300)
 
-	# Re-read in case settings changed while waiting
-	if not cint(
-		frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
-	):
+	# Only one auto-sync job may run the wait/sync cycle at a time.
+	# Without this, continue_chain jobs pile up and sync every ~1s.
+	cache = frappe.cache()
+	lock_key = cache.make_key(AUTO_SYNC_LOCK_KEY)
+	acquired = cache.set(lock_key, "1", nx=True, ex=lock_ttl)
+	if not acquired:
 		return
-
-	settings = frappe.get_single("eSSL Integration Settings")
 
 	try:
+		last_auto_sync_at = _settings_value("last_auto_sync_at")
+		if not _wait_until_next_interval(interval_seconds, last_auto_sync_at):
+			return
+
+		if not cint(_settings_value("enable_auto_sync")):
+			return
+
+		# Stamp the cycle start BEFORE calling eSSL so the next run waits
+		# a full interval from now (not from sync completion).
+		_mark_last_auto_sync()
+
+		settings = frappe.get_single("eSSL Integration Settings")
 		settings.flags.ignore_permissions = True
 		result = settings.sync_punches()
-		_mark_last_auto_sync()
 
 		if result and result.get("errors"):
 			frappe.log_error(
@@ -1039,11 +1063,6 @@ def auto_sync_essl_punches():
 				reference_name="eSSL Integration Settings",
 			)
 	except Exception:
-		# Still stamp the time so Desk shows the attempt, then keep the chain alive.
-		try:
-			_mark_last_auto_sync()
-		except Exception:
-			pass
 		frappe.log_error(
 			title="eSSL Auto Sync Failed",
 			message=frappe.get_traceback(),
@@ -1051,10 +1070,12 @@ def auto_sync_essl_punches():
 			reference_name="eSSL Integration Settings",
 		)
 	finally:
-		# Must continue the chain even while this job is still "started".
-		if cint(
-			frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
-		):
+		try:
+			cache.delete(lock_key)
+		except Exception:
+			pass
+
+		if cint(_settings_value("enable_auto_sync")):
 			_enqueue_next_auto_sync(continue_chain=True)
 
 
@@ -1063,9 +1084,11 @@ def ensure_auto_sync_running():
 	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
 		return
 
-	if not cint(
-		frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
-	):
+	if not cint(_settings_value("enable_auto_sync")):
+		return
+
+	# If a run lock exists, the chain is active.
+	if frappe.cache().get(frappe.cache().make_key(AUTO_SYNC_LOCK_KEY)):
 		return
 
 	try:
@@ -1089,6 +1112,10 @@ def _cancel_auto_sync_job():
 			job.delete()
 	except Exception:
 		pass
+	try:
+		frappe.cache().delete(frappe.cache().make_key(AUTO_SYNC_LOCK_KEY))
+	except Exception:
+		pass
 
 
 def _enqueue_next_auto_sync(force=False, continue_chain=False):
@@ -1097,24 +1124,15 @@ def _enqueue_next_auto_sync(force=False, continue_chain=False):
 	- continue_chain: used from a running job's finally (must not dedupe on same job_id)
 	- force: used from Save / watchdog to (re)start the chain
 	"""
-	if not cint(
-		frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
-	):
+	if not cint(_settings_value("enable_auto_sync")):
 		return
 
-	interval_seconds = max(
-		cint(
-			frappe.db.get_single_value("eSSL Integration Settings", "auto_sync_interval")
-		)
-		or 30,
-		5,
-	)
+	interval_seconds = max(cint(_settings_value("auto_sync_interval")) or 30, 5)
 	timeout = max(interval_seconds + READ_TIMEOUT + 60, 300)
 
 	try:
 		if continue_chain:
-			# Do not use the fixed job_id here — the current job is still "started",
-			# so dedupe would skip and the chain would die (seen on Frappe Cloud).
+			# Unique job id so enqueue works while the current job is still "started".
 			frappe.enqueue(
 				AUTO_SYNC_METHOD,
 				queue="short",
