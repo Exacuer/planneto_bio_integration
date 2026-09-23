@@ -5,6 +5,7 @@ from urllib.parse import urlparse, urlunparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 import hashlib
+import time
 
 import frappe
 import requests
@@ -372,11 +373,11 @@ class eSSLIntegrationSettings(Document):
 		}
 
 	def on_update(self):
-		if cint(self.enable_auto_sync) and (
-			self.has_value_changed("enable_auto_sync")
-			or self.has_value_changed("auto_sync_interval")
-		):
-			_enqueue_next_auto_sync(cint(self.auto_sync_interval) or 30)
+		if cint(self.enable_auto_sync):
+			# Restart the job chain whenever Auto Sync is on.
+			_enqueue_next_auto_sync(force=True)
+		else:
+			_cancel_auto_sync_job()
 
 	def _get_api_credentials(self):
 		username = (self.username or "").strip()
@@ -955,6 +956,43 @@ class eSSLIntegrationSettings(Document):
 		return "\t" in text or "\n" in text
 
 
+AUTO_SYNC_JOB_ID = "planneto_essl_auto_sync"
+AUTO_SYNC_METHOD = (
+	"planneto_bio_integration.planneto_bio_integration.doctype."
+	"essl_integration_settings.essl_integration_settings.auto_sync_essl_punches"
+)
+
+
+def _is_valid_sync_time(value):
+	if not value:
+		return False
+	try:
+		dt = get_datetime(value)
+	except Exception:
+		return False
+	return bool(dt and dt.year > 1900)
+
+
+def _wait_until_next_interval(interval_seconds, last_auto_sync_at):
+	"""Sleep until the interval has elapsed (or Auto Sync is disabled)."""
+	if not _is_valid_sync_time(last_auto_sync_at):
+		return True
+
+	while True:
+		if not cint(
+			frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
+		):
+			return False
+
+		elapsed = time_diff_in_seconds(
+			now_datetime(), get_datetime(last_auto_sync_at)
+		)
+		remaining = interval_seconds - elapsed
+		if remaining <= 0:
+			return True
+		time.sleep(min(remaining, 2))
+
+
 def auto_sync_essl_punches():
 	"""Sync punches when Auto Sync is enabled (interval in seconds)."""
 	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
@@ -967,14 +1005,17 @@ def auto_sync_essl_punches():
 	if not settings.base_url or not settings.username:
 		return
 
-	interval_seconds = cint(settings.auto_sync_interval) or 30
-	if settings.last_auto_sync_at:
-		elapsed = time_diff_in_seconds(
-			now_datetime(), get_datetime(settings.last_auto_sync_at)
-		)
-		if elapsed < interval_seconds:
-			_enqueue_next_auto_sync(interval_seconds)
-			return
+	interval_seconds = max(cint(settings.auto_sync_interval) or 30, 5)
+	if not _wait_until_next_interval(interval_seconds, settings.last_auto_sync_at):
+		return
+
+	# Re-read in case settings changed while waiting
+	if not cint(
+		frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
+	):
+		return
+
+	settings = frappe.get_single("eSSL Integration Settings")
 
 	try:
 		settings.flags.ignore_permissions = True
@@ -1001,20 +1042,55 @@ def auto_sync_essl_punches():
 			reference_name="eSSL Integration Settings",
 		)
 	finally:
-		_enqueue_next_auto_sync(interval_seconds)
+		_enqueue_next_auto_sync()
 
 
-def _enqueue_next_auto_sync(interval_seconds):
-	"""Queue the next auto sync after the selected seconds."""
+def _cancel_auto_sync_job():
+	try:
+		from frappe.utils.background_jobs import get_job
+
+		job = get_job(AUTO_SYNC_JOB_ID)
+		if job:
+			job.delete()
+	except Exception:
+		pass
+
+
+def _enqueue_next_auto_sync(force=False):
+	"""Queue the next auto sync job (worker sleeps until the interval is due)."""
+	try:
+		from frappe.utils.background_jobs import get_job
+
+		job = get_job(AUTO_SYNC_JOB_ID)
+		if job:
+			status = job.get_status()
+			if not force and status in ("queued", "started"):
+				return
+			job.delete()
+	except Exception:
+		pass
+
+	interval_seconds = max(
+		cint(
+			frappe.db.get_single_value("eSSL Integration Settings", "auto_sync_interval")
+		)
+		or 30,
+		5,
+	)
+
 	try:
 		frappe.enqueue(
-			"planneto_bio_integration.planneto_bio_integration.doctype.essl_integration_settings.essl_integration_settings.auto_sync_essl_punches",
+			AUTO_SYNC_METHOD,
 			queue="short",
-			timeout=max(cint(interval_seconds) + READ_TIMEOUT + 60, 180),
-			enqueue_after_seconds=max(cint(interval_seconds), 5),
-			job_id="planneto_essl_auto_sync",
+			timeout=max(interval_seconds + READ_TIMEOUT + 60, 300),
+			job_id=AUTO_SYNC_JOB_ID,
 			deduplicate=True,
 		)
 	except Exception:
-		pass
+		frappe.log_error(
+			title="eSSL Auto Sync enqueue failed",
+			message=frappe.get_traceback(),
+			reference_doctype="eSSL Integration Settings",
+			reference_name="eSSL Integration Settings",
+		)
 
