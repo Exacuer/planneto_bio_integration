@@ -42,6 +42,35 @@
    "reqd": 1
   },
   {
+   "fieldname": "auto_sync_section",
+   "fieldtype": "Section Break",
+   "label": "Auto Sync"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_auto_sync",
+   "fieldtype": "Check",
+   "label": "Enable Auto Sync"
+  },
+  {
+   "fieldname": "column_break_auto",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "60",
+   "depends_on": "enable_auto_sync",
+   "fieldname": "auto_sync_interval",
+   "fieldtype": "Select",
+   "label": "Sync Every (Seconds)",
+   "options": "30\n60\n90\n120\n160\n180"
+  },
+  {
+   "fieldname": "last_auto_sync_at",
+   "fieldtype": "Datetime",
+   "label": "Last Auto Sync At",
+   "read_only": 1
+  },
+  {
    "fieldname": "devices_section",
    "fieldtype": "Section Break",
    "label": "Devices"

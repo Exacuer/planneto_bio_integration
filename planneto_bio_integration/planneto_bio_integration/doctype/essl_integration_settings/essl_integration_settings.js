@@ -11,6 +11,14 @@ frappe.ui.form.on("eSSL Integration Settings", {
 			}
 		});
 
+		frm.add_custom_button(__("Test Connection"), function () {
+			if (frm.is_dirty()) {
+				frm.save().then(() => frm.trigger("run_test_connection"));
+			} else {
+				frm.trigger("run_test_connection");
+			}
+		});
+
 		frm.add_custom_button(__("Link Raw Punches"), function () {
 			frappe.call({
 				method: "link_raw_punches",
@@ -49,6 +57,25 @@ frappe.ui.form.on("eSSL Integration Settings", {
 						message: message,
 					});
 					frm.refresh();
+				}
+			},
+		});
+	},
+
+	run_test_connection(frm) {
+		frappe.call({
+			method: "test_connection",
+			doc: frm.doc,
+			freeze: true,
+			freeze_message: __("Testing eSSL connection..."),
+			callback: function (r) {
+				if (!r.exc) {
+					let payload = r.message || {};
+					frappe.msgprint({
+						title: __("Test Connection"),
+						indicator: "green",
+						message: payload.message || __("Connection successful."),
+					});
 				}
 			},
 		});

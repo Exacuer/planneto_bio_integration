@@ -10,7 +10,7 @@ import frappe
 import requests
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import get_datetime, now_datetime
+from frappe.utils import cint, get_datetime, now_datetime, time_diff_in_seconds
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -327,6 +327,56 @@ class eSSLIntegrationSettings(Document):
 			"still_missing": still_missing,
 			"message": message,
 		}
+
+	@frappe.whitelist()
+	def test_connection(self):
+		if not self.base_url:
+			frappe.throw(_("Please configure Base URL."))
+
+		username, password = self._get_api_credentials()
+		api_url = self._get_api_url()
+		serial_number = ""
+		for device in self.devices or []:
+			if device.enabled and (device.serial_number or "").strip():
+				serial_number = device.serial_number.strip()
+				break
+
+		now = now_datetime()
+		from_time_str = now.strftime(ESSL_DATETIME_FORMAT)
+		to_time_str = from_time_str
+
+		try:
+			result_text, _punch_text = self._fetch_device_logs(
+				api_url=api_url,
+				username=username,
+				password=password,
+				serial_number=serial_number or "TEST",
+				from_time_str=from_time_str,
+				to_time_str=to_time_str,
+			)
+		except eSSLAPIError as e:
+			frappe.throw(_("eSSL login failed: {0}").format(str(e)))
+		except requests.exceptions.ConnectTimeout:
+			frappe.throw(self._connection_error_message(api_url))
+		except requests.ConnectionError:
+			frappe.throw(self._connection_error_message(api_url))
+		except Exception as e:
+			self._log_error("eSSL: Test connection failed", api_url=api_url, error=str(e))
+			frappe.throw(_("Could not reach eSSL API: {0}").format(str(e)))
+
+		return {
+			"ok": True,
+			"message": _("Logged in to {0} as {1}. Result: {2}").format(
+				api_url, username, result_text or _("OK")
+			),
+		}
+
+	def on_update(self):
+		if cint(self.enable_auto_sync) and (
+			self.has_value_changed("enable_auto_sync")
+			or self.has_value_changed("auto_sync_interval")
+		):
+			_enqueue_next_auto_sync(cint(self.auto_sync_interval) or 60)
 
 	def _get_api_credentials(self):
 		username = (self.username or "").strip()
@@ -903,4 +953,68 @@ class eSSLIntegrationSettings(Document):
 		if not text:
 			return False
 		return "\t" in text or "\n" in text
+
+
+def auto_sync_essl_punches():
+	"""Sync punches when Auto Sync is enabled (interval in seconds)."""
+	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
+		return
+
+	settings = frappe.get_single("eSSL Integration Settings")
+	if not cint(settings.enable_auto_sync):
+		return
+
+	if not settings.base_url or not settings.username:
+		return
+
+	interval_seconds = cint(settings.auto_sync_interval) or 60
+	if settings.last_auto_sync_at:
+		elapsed = time_diff_in_seconds(
+			now_datetime(), get_datetime(settings.last_auto_sync_at)
+		)
+		if elapsed < interval_seconds:
+			_enqueue_next_auto_sync(interval_seconds)
+			return
+
+	try:
+		settings.flags.ignore_permissions = True
+		result = settings.sync_punches()
+		frappe.db.set_single_value(
+			"eSSL Integration Settings",
+			"last_auto_sync_at",
+			now_datetime(),
+		)
+		frappe.db.commit()
+
+		if result and result.get("errors"):
+			frappe.log_error(
+				title="eSSL Auto Sync warning",
+				message="\n".join(result.get("errors") or []),
+				reference_doctype="eSSL Integration Settings",
+				reference_name="eSSL Integration Settings",
+			)
+	except Exception:
+		frappe.log_error(
+			title="eSSL Auto Sync Failed",
+			message=frappe.get_traceback(),
+			reference_doctype="eSSL Integration Settings",
+			reference_name="eSSL Integration Settings",
+		)
+	finally:
+		_enqueue_next_auto_sync(interval_seconds)
+
+
+def _enqueue_next_auto_sync(interval_seconds):
+	"""Queue the next auto sync after the selected seconds."""
+	try:
+		frappe.enqueue(
+			"planneto_bio_integration.planneto_bio_integration.doctype.essl_integration_settings.essl_integration_settings.auto_sync_essl_punches",
+			queue="short",
+			timeout=max(cint(interval_seconds) + READ_TIMEOUT + 60, 180),
+			enqueue_after_seconds=max(cint(interval_seconds), 30),
+			job_id="planneto_essl_auto_sync",
+			deduplicate=True,
+		)
+	except Exception:
+		pass
 
