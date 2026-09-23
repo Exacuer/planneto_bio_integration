@@ -20,7 +20,6 @@
    "label": "eSSL Server"
   },
   {
-   "description": "Base URL of the eSSL Web service e.g. http://192.168.1.100/ESSLService",
    "fieldname": "base_url",
    "fieldtype": "Data",
    "label": "Base URL",

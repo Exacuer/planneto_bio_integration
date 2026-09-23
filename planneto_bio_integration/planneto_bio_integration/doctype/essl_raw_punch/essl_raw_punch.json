@@ -48,6 +48,13 @@
    "reqd": 1
   },
   {
+   "fieldname": "log_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Log Type",
+   "options": "\nIN\nOUT"
+  },
+  {
    "fieldname": "device_serial",
    "fieldtype": "Data",
    "label": "Device Serial"

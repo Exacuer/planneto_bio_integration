@@ -5,13 +5,31 @@ frappe.ui.form.on("eSSL Integration Settings", {
 	refresh(frm) {
 		frm.add_custom_button(__("Sync"), function () {
 			if (frm.is_dirty()) {
-				frm.save().then(() => {
-					frm.trigger("run_sync");
-				});
+				frm.save().then(() => frm.trigger("run_sync"));
 			} else {
 				frm.trigger("run_sync");
 			}
-		}).addClass("btn-primary");
+		});
+
+		frm.add_custom_button(__("Link Raw Punches"), function () {
+			frappe.call({
+				method: "link_raw_punches",
+				doc: frm.doc,
+				freeze: true,
+				freeze_message: __("Linking raw punches to employees..."),
+				callback: function (r) {
+					if (!r.exc) {
+						let payload = r.message || {};
+						frappe.msgprint({
+							title: __("Link Raw Punches"),
+							indicator: "green",
+							message: payload.message || __("Linking completed."),
+						});
+						frm.refresh();
+					}
+				},
+			});
+		});
 	},
 
 	run_sync(frm) {
@@ -22,16 +40,17 @@ frappe.ui.form.on("eSSL Integration Settings", {
 			freeze_message: __("Syncing punches from eSSL server..."),
 			callback: function (r) {
 				if (!r.exc) {
-					let message = (r.message && r.message.message) || r.message || __("Sync completed successfully.");
+					let payload = r.message || {};
+					let message = payload.message || __("Sync completed.");
+					let has_errors = payload.errors && payload.errors.length;
 					frappe.msgprint({
-						title: __("Sync Completed"),
-						indicator: "green",
-						message: message
+						title: has_errors ? __("Sync Failed") : __("Sync Completed"),
+						indicator: has_errors ? "red" : "green",
+						message: message,
 					});
 					frm.refresh();
 				}
-			}
+			},
 		});
-	}
+	},
 });
-
