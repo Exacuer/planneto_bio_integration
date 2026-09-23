@@ -993,6 +993,15 @@ def _wait_until_next_interval(interval_seconds, last_auto_sync_at):
 		time.sleep(min(remaining, 2))
 
 
+def _mark_last_auto_sync():
+	frappe.db.set_single_value(
+		"eSSL Integration Settings",
+		"last_auto_sync_at",
+		now_datetime(),
+	)
+	frappe.db.commit()
+
+
 def auto_sync_essl_punches():
 	"""Sync punches when Auto Sync is enabled (interval in seconds)."""
 	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
@@ -1020,12 +1029,7 @@ def auto_sync_essl_punches():
 	try:
 		settings.flags.ignore_permissions = True
 		result = settings.sync_punches()
-		frappe.db.set_single_value(
-			"eSSL Integration Settings",
-			"last_auto_sync_at",
-			now_datetime(),
-		)
-		frappe.db.commit()
+		_mark_last_auto_sync()
 
 		if result and result.get("errors"):
 			frappe.log_error(
@@ -1035,6 +1039,11 @@ def auto_sync_essl_punches():
 				reference_name="eSSL Integration Settings",
 			)
 	except Exception:
+		# Still stamp the time so Desk shows the attempt, then keep the chain alive.
+		try:
+			_mark_last_auto_sync()
+		except Exception:
+			pass
 		frappe.log_error(
 			title="eSSL Auto Sync Failed",
 			message=frappe.get_traceback(),
@@ -1042,7 +1051,33 @@ def auto_sync_essl_punches():
 			reference_name="eSSL Integration Settings",
 		)
 	finally:
-		_enqueue_next_auto_sync()
+		# Must continue the chain even while this job is still "started".
+		if cint(
+			frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
+		):
+			_enqueue_next_auto_sync(continue_chain=True)
+
+
+def ensure_auto_sync_running():
+	"""Scheduler watchdog: restart the Auto Sync chain if it stopped."""
+	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
+		return
+
+	if not cint(
+		frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
+	):
+		return
+
+	try:
+		from frappe.utils.background_jobs import get_job
+
+		job = get_job(AUTO_SYNC_JOB_ID)
+		if job and job.get_status() in ("queued", "started"):
+			return
+	except Exception:
+		pass
+
+	_enqueue_next_auto_sync(force=True)
 
 
 def _cancel_auto_sync_job():
@@ -1056,19 +1091,16 @@ def _cancel_auto_sync_job():
 		pass
 
 
-def _enqueue_next_auto_sync(force=False):
-	"""Queue the next auto sync job (worker sleeps until the interval is due)."""
-	try:
-		from frappe.utils.background_jobs import get_job
+def _enqueue_next_auto_sync(force=False, continue_chain=False):
+	"""Queue the next auto sync job.
 
-		job = get_job(AUTO_SYNC_JOB_ID)
-		if job:
-			status = job.get_status()
-			if not force and status in ("queued", "started"):
-				return
-			job.delete()
-	except Exception:
-		pass
+	- continue_chain: used from a running job's finally (must not dedupe on same job_id)
+	- force: used from Save / watchdog to (re)start the chain
+	"""
+	if not cint(
+		frappe.db.get_single_value("eSSL Integration Settings", "enable_auto_sync")
+	):
+		return
 
 	interval_seconds = max(
 		cint(
@@ -1077,12 +1109,36 @@ def _enqueue_next_auto_sync(force=False):
 		or 30,
 		5,
 	)
+	timeout = max(interval_seconds + READ_TIMEOUT + 60, 300)
 
 	try:
+		if continue_chain:
+			# Do not use the fixed job_id here — the current job is still "started",
+			# so dedupe would skip and the chain would die (seen on Frappe Cloud).
+			frappe.enqueue(
+				AUTO_SYNC_METHOD,
+				queue="short",
+				timeout=timeout,
+				job_id=f"{AUTO_SYNC_JOB_ID}:{frappe.generate_hash(length=10)}",
+			)
+			return
+
+		from frappe.utils.background_jobs import get_job
+
+		job = get_job(AUTO_SYNC_JOB_ID)
+		if job:
+			status = job.get_status()
+			if not force and status in ("queued", "started"):
+				return
+			try:
+				job.delete()
+			except Exception:
+				pass
+
 		frappe.enqueue(
 			AUTO_SYNC_METHOD,
 			queue="short",
-			timeout=max(interval_seconds + READ_TIMEOUT + 60, 300),
+			timeout=timeout,
 			job_id=AUTO_SYNC_JOB_ID,
 			deduplicate=True,
 		)

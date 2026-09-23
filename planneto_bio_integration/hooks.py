@@ -10,7 +10,10 @@ required_apps = ["hrms"]
 export_python_type_annotations = True
 
 scheduler_events = {
-	"all": [
-		"planneto_bio_integration.planneto_bio_integration.doctype.essl_integration_settings.essl_integration_settings.auto_sync_essl_punches"
-	]
+	# Watchdog: if the background job chain stops (common on cloud), restart it.
+	"cron": {
+		"*/1 * * * *": [
+			"planneto_bio_integration.planneto_bio_integration.doctype.essl_integration_settings.essl_integration_settings.ensure_auto_sync_running"
+		]
+	}
 }
