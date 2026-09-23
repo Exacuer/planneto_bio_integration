@@ -376,7 +376,7 @@ class eSSLIntegrationSettings(Document):
 			self.has_value_changed("enable_auto_sync")
 			or self.has_value_changed("auto_sync_interval")
 		):
-			_enqueue_next_auto_sync(cint(self.auto_sync_interval) or 60)
+			_enqueue_next_auto_sync(cint(self.auto_sync_interval) or 30)
 
 	def _get_api_credentials(self):
 		username = (self.username or "").strip()
@@ -967,7 +967,7 @@ def auto_sync_essl_punches():
 	if not settings.base_url or not settings.username:
 		return
 
-	interval_seconds = cint(settings.auto_sync_interval) or 60
+	interval_seconds = cint(settings.auto_sync_interval) or 30
 	if settings.last_auto_sync_at:
 		elapsed = time_diff_in_seconds(
 			now_datetime(), get_datetime(settings.last_auto_sync_at)
@@ -1011,7 +1011,7 @@ def _enqueue_next_auto_sync(interval_seconds):
 			"planneto_bio_integration.planneto_bio_integration.doctype.essl_integration_settings.essl_integration_settings.auto_sync_essl_punches",
 			queue="short",
 			timeout=max(cint(interval_seconds) + READ_TIMEOUT + 60, 180),
-			enqueue_after_seconds=max(cint(interval_seconds), 30),
+			enqueue_after_seconds=max(cint(interval_seconds), 5),
 			job_id="planneto_essl_auto_sync",
 			deduplicate=True,
 		)
