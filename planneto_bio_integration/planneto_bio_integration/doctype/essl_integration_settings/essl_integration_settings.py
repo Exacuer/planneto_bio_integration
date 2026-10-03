@@ -1017,8 +1017,16 @@ def _mark_last_auto_sync():
 	)
 
 
+def _auto_sync_interval_seconds():
+	"""auto_sync_interval is stored in minutes (5/10/15/20/25/30)."""
+	minutes = cint(_settings_value("auto_sync_interval")) or 5
+	if minutes not in (5, 10, 15, 20, 25, 30):
+		minutes = 5
+	return minutes * 60
+
+
 def auto_sync_essl_punches():
-	"""Sync punches when Auto Sync is enabled (interval in seconds)."""
+	"""Sync punches when Auto Sync is enabled (interval in minutes)."""
 	if not frappe.db.exists("DocType", "eSSL Integration Settings"):
 		return
 
@@ -1028,7 +1036,7 @@ def auto_sync_essl_punches():
 	if not _settings_value("base_url") or not _settings_value("username"):
 		return
 
-	interval_seconds = max(cint(_settings_value("auto_sync_interval")) or 30, 5)
+	interval_seconds = _auto_sync_interval_seconds()
 	lock_ttl = max(interval_seconds + READ_TIMEOUT + 60, 300)
 
 	# Only one auto-sync job may run the wait/sync cycle at a time.
@@ -1127,7 +1135,7 @@ def _enqueue_next_auto_sync(force=False, continue_chain=False):
 	if not cint(_settings_value("enable_auto_sync")):
 		return
 
-	interval_seconds = max(cint(_settings_value("auto_sync_interval")) or 30, 5)
+	interval_seconds = _auto_sync_interval_seconds()
 	timeout = max(interval_seconds + READ_TIMEOUT + 60, 300)
 
 	try:
